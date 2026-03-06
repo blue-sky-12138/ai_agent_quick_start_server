@@ -349,7 +349,15 @@ export class ZegoAIAgent {
             ASR: asrConfig || ASR
         };
         console.log('updateAgent body', body)
-        return this.sendRequest<any>(action, body);
+        const result = await this.sendRequest<any>(action, body);
+        console.log('updateAgent result', result);
+        if (result.Code !== 0) {
+            const err: any = new Error(`UpdateAgent 失败: ${result.Message} (Code: ${result.Code})`);
+            err.code = result.Code;
+            err.zegoMessage = result.Message;
+            throw err;
+        }
+        return result;
     }
 
     // 智能体注册逻辑
@@ -379,7 +387,7 @@ export class ZegoAIAgent {
     async createAgentInstance(agentId: string, userId: string, rtcInfo: RtcInfo, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null, messageHistory: MessageHistory | null = null, callbackConfig: CallbackConfig | null = null, advancedConfig: AdvancedConfig | null = null) {
         // https://aigc-aiagent-api.zegotech.cn?Action=CreateAgentInstance
         const action = 'CreateAgentInstance';
-        const body = {
+        const body: Record<string, any> = {
             AgentId: agentId,
             UserId: userId,
             RTC: rtcInfo,
@@ -388,21 +396,28 @@ export class ZegoAIAgent {
                 Messages: [],
                 WindowSize: 10
             },
-            LLM: llmConfig,
-            TTS: ttsConfig,
-            ASR: asrConfig,
-            CallbackConfig: callbackConfig,
-            AdvancedConfig: advancedConfig,
         };
+        if (llmConfig != null) body.LLM = llmConfig;
+        if (ttsConfig != null) body.TTS = ttsConfig;
+        if (asrConfig != null) body.ASR = asrConfig;
+        if (callbackConfig != null) body.CallbackConfig = callbackConfig;
+        if (advancedConfig != null) body.AdvancedConfig = advancedConfig;
         const result = await this.sendRequest<any>(action, body);
         console.log("create agent instance result", result);
+        if (result.Code !== 0) {
+            console.error("create agent instance failed, request body:", JSON.stringify(body, null, 2));
+            const err: any = new Error(`CreateAgentInstance 失败: ${result.Message} (Code: ${result.Code})`);
+            err.code = result.Code;
+            err.zegoMessage = result.Message;
+            throw err;
+        }
         return result;
     }
 
     async createDigitalHumanAgentInstance(agentId: string, userId: string, rtcInfo: RtcInfo, digitalHumanInfo: DigitalHumanInfo, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null, messageHistory: MessageHistory | null = null, callbackConfig: CallbackConfig | null = null) {
         // https://aigc-aiagent-api.zegotech.cn?Action=CreateDigitalHumanAgentInstance
         const action = 'CreateDigitalHumanAgentInstance';
-        const body = {
+        const body: Record<string, any> = {
             AgentId: agentId,
             UserId: userId,
             RTC: rtcInfo,
@@ -412,11 +427,11 @@ export class ZegoAIAgent {
                 Messages: [],
                 WindowSize: 10
             },
-            LLM: llmConfig,
-            TTS: ttsConfig,
-            ASR: asrConfig,
-            CallbackConfig: callbackConfig
         };
+        if (llmConfig != null) body.LLM = llmConfig;
+        if (ttsConfig != null) body.TTS = ttsConfig;
+        if (asrConfig != null) body.ASR = asrConfig;
+        if (callbackConfig != null) body.CallbackConfig = callbackConfig;
         const result = await this.sendRequest<any>(action, body);
         console.log("create digital human agent instance result", result);
         return result;
