@@ -79,6 +79,7 @@ export interface LLMConfig {
     Url: string;
     ApiKey: string;
     Model: string;
+    Vendor?: 'OpenAIChat' | 'OpenAIResponses';
     SystemPrompt?: string;
     Temperature?: number;
     TopP?: number;
@@ -267,11 +268,13 @@ export class ZegoAIAgent {
         const llmUrl = process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL || "";
         const llmApiKey = process.env.LLM_PROXY_AUTH_TOKEN || process.env.LLM_API_KEY || "";
         const llmModel = process.env.LLM_PROXY_UPSTREAM_MODEL || process.env.LLM_MODEL || "";
+        const llmVendor = (process.env.LLM_VENDOR as LLMConfig['Vendor']) || undefined;
         return {
             LLM: {
                 Url: llmUrl,
                 ApiKey: llmApiKey,
                 Model: llmModel,
+                Vendor: llmVendor,
                 SystemPrompt: process.env.LLM_SYSTEM_PROMPT || SYSTEM_PROMPT,
                 AddAgentInfo: addAgentInfo,
                 AgentExtraInfo: agentExtraInfo
@@ -346,7 +349,7 @@ export class ZegoAIAgent {
             TTS: ttsConfig || TTS,
             ASR: asrConfig || ASR
         };
-        console.log('updateAgent body', body)
+        console.log('updateAgent body', JSON.stringify(body, null, 2))
         const result = await this.sendRequest<any>(action, body);
         console.log('updateAgent result', result);
         if (result.Code !== 0) {
