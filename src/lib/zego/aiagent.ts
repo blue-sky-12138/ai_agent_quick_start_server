@@ -40,7 +40,7 @@ const SYSTEM_PROMPT = `
 
 // 常量定义
 export const CONSTANTS = {
-    AGENT_ID: "ai_agent_example_1",
+    AGENT_ID: "ai_agent_example_miniphice",
     AGENT_NAME: "李浩然",
     ERROR_CODES: {
       DIGITAL_HUMAN_CONCURRENCY_LIMIT: 410001025,
