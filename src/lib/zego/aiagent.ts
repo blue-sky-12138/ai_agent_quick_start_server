@@ -83,6 +83,8 @@ export interface LLMConfig {
     Temperature?: number;
     TopP?: number;
     Params?: any;
+    AddAgentInfo?: boolean;
+    AgentExtraInfo?: Record<string, unknown>;
 }
 
 export interface FilterText {
@@ -251,12 +253,27 @@ export class ZegoAIAgent {
     }
 
     getDefaultAgentConfig() {
+        const addAgentInfo = process.env.LLM_ADD_AGENT_INFO === "true";
+        let agentExtraInfo: Record<string, unknown> | undefined;
+        if (process.env.LLM_AGENT_EXTRA_INFO) {
+            try {
+                agentExtraInfo = JSON.parse(process.env.LLM_AGENT_EXTRA_INFO);
+            } catch (error) {
+                console.error("Invalid LLM_AGENT_EXTRA_INFO, expected JSON string:", error);
+            }
+        }
+        // 支持仅使用 LLM_PROXY：ZEGO 调用的地址用 LLM_PROXY_PUBLIC_URL（或 LLM_BASE_URL），Model/ApiKey 用 proxy 相关或原变量
+        const llmUrl = process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL || "";
+        const llmApiKey = process.env.LLM_PROXY_AUTH_TOKEN || process.env.LLM_API_KEY || "";
+        const llmModel = process.env.LLM_PROXY_UPSTREAM_MODEL || process.env.LLM_MODEL || "";
         return {
             LLM: {
-                Url: process.env.LLM_BASE_URL || "",
-                ApiKey: process.env.LLM_API_KEY || "",
-                Model: process.env.LLM_MODEL || "",
-                SystemPrompt: process.env.LLM_SYSTEM_PROMPT || SYSTEM_PROMPT
+                Url: llmUrl,
+                ApiKey: llmApiKey,
+                Model: llmModel,
+                SystemPrompt: process.env.LLM_SYSTEM_PROMPT || SYSTEM_PROMPT,
+                AddAgentInfo: addAgentInfo,
+                AgentExtraInfo: agentExtraInfo
             },
             TTS: {
                 Vendor: "ByteDance",
@@ -284,8 +301,9 @@ export class ZegoAIAgent {
     }
 
     async registerAgent(agentId: string, agentName: string, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null) {
-        if (!process.env.LLM_BASE_URL || !process.env.LLM_API_KEY || !process.env.LLM_MODEL) {
-            throw new Error('LLM_BASE_URL, LLM_API_KEY and LLM_MODEL environment variables must be set');
+        const hasLlmUrl = !!(process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL);
+        if (!hasLlmUrl) {
+            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/api/llm-proxy)');
         }
         const { LLM, TTS, ASR } = await this.getDefaultAgentConfig();
         // https://aigc-aiagent-api.zegotech.cn?Action=RegisterAgent
@@ -316,8 +334,9 @@ export class ZegoAIAgent {
     }
 
     async updateAgent(agentId: string, agentName: string, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null) {
-        if (!process.env.LLM_BASE_URL || !process.env.LLM_API_KEY || !process.env.LLM_MODEL) {
-            throw new Error('LLM_BASE_URL, LLM_API_KEY and LLM_MODEL environment variables must be set');
+        const hasLlmUrl = !!(process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL);
+        if (!hasLlmUrl) {
+            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/api/llm-proxy)');
         }
         const { LLM, TTS, ASR } = await this.getDefaultAgentConfig();
         // https://aigc-aiagent-api.zegotech.cn?Action=UpdateAgent

@@ -23,6 +23,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const store = AgentStore.getInstance();
+    if (!agent_instance_id) {
+      agent_instance_id = store.getAgentInstanceId();
+    }
+
     if (!agent_instance_id) {
       return Response.json(
         {
@@ -38,6 +43,11 @@ export async function POST(req: NextRequest) {
 
     const assistant = ZegoAIAgent.getInstance();
     await assistant.deleteAgentInstance(agent_instance_id);
+    store.unbindUserByAgentInstanceId(agent_instance_id);
+    store.clearLatestImage(agent_instance_id);
+    if (store.getAgentInstanceId() === agent_instance_id) {
+      store.setAgentInstanceId("");
+    }
 
     return Response.json(
       {

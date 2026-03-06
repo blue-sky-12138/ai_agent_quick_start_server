@@ -26,6 +26,8 @@ export async function POST(req: NextRequest) {
     const existingInstanceId = store.getAgentInstanceId();
     if (existingInstanceId) {
       await assistant.deleteAgentInstance(existingInstanceId);
+      store.unbindUserByAgentInstanceId(existingInstanceId);
+      store.clearLatestImage(existingInstanceId);
       store.setAgentInstanceId("");
     }
     const body = await req.json();
@@ -49,6 +51,8 @@ export async function POST(req: NextRequest) {
     }, llmConfig, ttsConfig, asrConfig, messageHistory, callbackConfig, advancedConfig);
     const agent_instance_id = result.Data.AgentInstanceId;
     console.log("create agent instance", agent_instance_id);
+    store.setAgentInstanceId(agent_instance_id);
+    store.bindUserToAgentInstance(user_id, agent_instance_id);
 
     return Response.json(
       {
