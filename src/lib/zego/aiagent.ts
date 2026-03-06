@@ -141,6 +141,7 @@ export class ZegoAIAgent {
     private appId: number;
     private serverSecret: string;
     private baseUrl = 'https://aigc-aiagent-api.zegotech.cn';
+    private registeredAgentIds = new Set<string>();
 
     private constructor(config: ZegoConfig) {
         this.appId = config.appId;
@@ -320,16 +321,13 @@ export class ZegoAIAgent {
 
     compareAgentConfig(config: any) {
         const { LLM, TTS, ASR } = this.getDefaultAgentConfig();
-        const defaultConfig = {
-            LLM,
-            TTS,
-            ASR
-        }
-        const agentConfig = {
+        // JSON round-trip strips undefined values, matching how ZEGO stores and returns config
+        const defaultConfig = JSON.parse(JSON.stringify({ LLM, TTS, ASR }));
+        const agentConfig = JSON.parse(JSON.stringify({
             LLM: config.LLM,
             TTS: config.TTS,
             ASR: config.ASR
-        }
+        }));
         return isEqual(agentConfig, defaultConfig);
     }
 
@@ -362,6 +360,9 @@ export class ZegoAIAgent {
 
     // 智能体注册逻辑
     async ensureAgentRegistered(agentId: string, agentName: string): Promise<void> {
+      if (this.registeredAgentIds.has(agentId)) {
+        return;
+      }
       try {
         const agents = await this.queryAgents([agentId]);
         const agentExists = agents?.length > 0 &&
@@ -378,6 +379,7 @@ export class ZegoAIAgent {
             await this.updateAgent(agentId, agentName);
           }
         }
+        this.registeredAgentIds.add(agentId);
       } catch (error) {
         console.error(`智能体注册失败: ${agentId}`, error);
         throw new Error(`智能体注册失败: ${(error as any).message}`);
