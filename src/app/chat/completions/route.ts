@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AgentStore } from "@/lib/store";
+import OpenAI from "openai";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 type ContentPart = {
   type: string;
@@ -16,6 +19,7 @@ type ChatMessage = {
 
 interface ChatRequestBody {
   model?: string;
+  stream?: boolean;
   user?: string;
   user_id?: string;
   agent_instance_id?: string;
@@ -29,10 +33,10 @@ interface ChatRequestBody {
   [key: string]: unknown;
 }
 
-const DEFAULT_UPSTREAM_URL = "https://openrouter.ai/api/v1/chat/completions";
+// ─── Default system prompt ────────────────────────────────────────────────────
 
 /** 加密货币交易所教学帮助人员 - 默认 system prompt（可通过 LLM_PROXY_SYSTEM_PROMPT 覆盖） */
-const DEFAULT_SYSTEM_PROMPT_CRYPTO =
+const DEFAULT_SYSTEM_PROMPT =
   "回答问题要求：你在做角色扮演，请按照人设要求与用户对话，直接输出回答，回答时以句号为维度，单次回答最长不要超过3句，不能超过100字。\n" +
   "若用户提供了图片，请结合图片内容回答；若未提供图片，仅根据文字回答即可。\n" +
   "角色：林晓数\n" +
@@ -59,14 +63,9 @@ const DEFAULT_SYSTEM_PROMPT_CRYPTO =
   "5. 用户：老师，我想参加交易大赛。\n" +
   "林晓数：可以，当练手和学规则就好，别把比赛当实盘梭哈。\n";
 
-function parseAuthorizationToken(request: NextRequest): string {
-  const authHeader = request.headers.get("authorization") || "";
-  const [scheme, token] = authHeader.split(" ");
-  if (scheme?.toLowerCase() !== "bearer" || !token) return "";
-  return token.trim();
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// 优先使用 agent_info.agent_instance_id（ZEGO/脚本都会带），再 fallback 到 query/header/body；统一转成 string（JSON 可能解析为 number）
+// 优先使用 agent_info.agent_instance_id，再 fallback 到 query/header/body；统一转成 string
 function resolveAgentInstanceId(request: NextRequest, body: ChatRequestBody): string {
   const fromAgentInfo =
     body.agent_info?.agent_instance_id != null
@@ -97,25 +96,18 @@ function injectImageIntoLastUserMessage(messages: ChatMessage[], imageDataURL: s
       break;
     }
   }
-
   if (targetIndex < 0) return nextMessages;
 
   const targetMessage = nextMessages[targetIndex];
   const currentContent = targetMessage.content;
-  // OpenRouter/OpenAI 兼容：url 支持 base64 data URL（data:image/jpeg;base64,... 或 data:image/png;base64,...）
   const imagePart: ContentPart = {
     type: "image_url",
-    image_url: {
-      url: imageDataURL,
-    },
+    image_url: { url: imageDataURL },
   };
 
   let nextContent: ContentPart[];
   if (typeof currentContent === "string") {
-    nextContent = [
-      { type: "text", text: currentContent },
-      imagePart,
-    ];
+    nextContent = [{ type: "text", text: currentContent }, imagePart];
   } else if (Array.isArray(currentContent)) {
     const withoutImageParts = currentContent.filter((part) => part?.type !== "image_url");
     nextContent = [...withoutImageParts, imagePart];
@@ -123,41 +115,29 @@ function injectImageIntoLastUserMessage(messages: ChatMessage[], imageDataURL: s
     nextContent = [imagePart];
   }
 
-  nextMessages[targetIndex] = {
-    ...targetMessage,
-    content: nextContent,
-  };
-
+  nextMessages[targetIndex] = { ...targetMessage, content: nextContent };
   return nextMessages;
 }
 
 function withInjectedImage(body: ChatRequestBody, imageDataURL: string): ChatRequestBody {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   if (messages.length === 0) return body;
-
-  return {
-    ...body,
-    messages: injectImageIntoLastUserMessage(messages, imageDataURL),
-  };
+  return { ...body, messages: injectImageIntoLastUserMessage(messages, imageDataURL) };
 }
+
+// ─── Route handlers ───────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
   try {
-    const expectedInboundToken = process.env.LLM_PROXY_AUTH_TOKEN || "";
-    if (expectedInboundToken) {
-      const inboundToken = parseAuthorizationToken(request);
-      if (inboundToken !== expectedInboundToken) {
-        return NextResponse.json(
-          {
-            code: 401,
-            message: "unauthorized",
-          },
-          { status: 401 }
-        );
-      }
+    // ── 1. 解析请求体 ────────────────────────────────────────────────────────
+    const body = (await request.json()) as ChatRequestBody;
+    console.log("[chat/completions] requestData:", JSON.stringify(body));
+
+    if (!body.messages || body.messages.length === 0) {
+      return NextResponse.json({ error: "Messages are required" }, { status: 400 });
     }
 
-    const body = (await request.json()) as ChatRequestBody;
+    // ── 2. 解析 agentInstanceId，获取图片并注入（需求 2、3）───────────────────
     const store = AgentStore.getInstance();
 
     let agentInstanceId = resolveAgentInstanceId(request, body);
@@ -169,15 +149,16 @@ export async function POST(request: NextRequest) {
     }
 
     const imageInstanceIds = store.getImageInstanceIds();
-    console.log("[llm-proxy] images in memory (instance_ids):", imageInstanceIds.length ? imageInstanceIds : "(none)");
+    console.log("[chat/completions] images in memory (instance_ids):", imageInstanceIds.length ? imageInstanceIds : "(none)");
     const imageDataURL = agentInstanceId ? store.getLatestImageDataURL(agentInstanceId) : "";
-    console.log("[llm-proxy] agent_instance_id from agent_info/request:", agentInstanceId || "(none)", "hasImage:", !!imageDataURL);
-    const payload = imageDataURL ? withInjectedImage(body, imageDataURL) : body;
+    console.log("[chat/completions] agent_instance_id:", agentInstanceId || "(none)", "hasImage:", !!imageDataURL);
 
-    // 使用加密货币交易所教学帮助人员 system prompt（支持 .env LLM_PROXY_SYSTEM_PROMPT 覆盖）
+    const payload = imageDataURL ? withInjectedImage(body, imageDataURL) : { ...body };
+
+    // ── 3. 强制替换 system prompt（需求 4）──────────────────────────────────
     const systemPrompt =
       (typeof process.env.LLM_PROXY_SYSTEM_PROMPT === "string" && process.env.LLM_PROXY_SYSTEM_PROMPT.trim()) ||
-      DEFAULT_SYSTEM_PROMPT_CRYPTO;
+      DEFAULT_SYSTEM_PROMPT;
     const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
     const systemIndex = messages.findIndex((m) => m?.role === "system");
     const systemMessage = { role: "system" as const, content: systemPrompt };
@@ -188,24 +169,28 @@ export async function POST(request: NextRequest) {
     }
     payload.messages = messages;
 
-    // 优先使用 .env 中的模型，保证代理侧配置生效（覆盖 ZEGO/客户端传入的 model）
+    // ── 4. 强制覆盖 model（需求 9）──────────────────────────────────────────
     if (process.env.LLM_PROXY_UPSTREAM_MODEL) {
       payload.model = process.env.LLM_PROXY_UPSTREAM_MODEL;
     }
+    const model = payload.model || "";
 
-    const upstreamURL = process.env.LLM_PROXY_UPSTREAM_URL || DEFAULT_UPSTREAM_URL;
+    // ── 5. 初始化 OpenAI 客户端（需求 5：不校验 token，直接用环境变量 key）──
     const upstreamAPIKey = process.env.LLM_PROXY_UPSTREAM_API_KEY || "";
     if (!upstreamAPIKey) {
       return NextResponse.json(
-        {
-          code: 500,
-          message: "LLM_PROXY_UPSTREAM_API_KEY is required",
-        },
+        { code: 500, message: "LLM_PROXY_UPSTREAM_API_KEY is required" },
         { status: 500 }
       );
     }
 
-    // 打印发往第三方 API 的完整请求体（base64 图片用占位符，避免刷屏）
+    // LLM_PROXY_UPSTREAM_URL 可以是完整 endpoint（含 /chat/completions），也可以是 base URL
+    const upstreamURL = process.env.LLM_PROXY_UPSTREAM_URL || "https://openrouter.ai/api/v1/chat/completions";
+    const baseURL = upstreamURL.replace(/\/chat\/completions\/?$/, "");
+
+    const openai = new OpenAI({ apiKey: upstreamAPIKey, baseURL });
+
+    // 打印发往上游的请求体（base64 图片用占位符，避免刷屏）
     const bodyForLog = (() => {
       const copy = JSON.parse(JSON.stringify(payload)) as ChatRequestBody;
       const m = copy.messages;
@@ -224,60 +209,83 @@ export async function POST(request: NextRequest) {
       }
       return copy;
     })();
-    console.log("[llm-proxy] request to upstream:", upstreamURL);
-    console.log("[llm-proxy] request body:", JSON.stringify(bodyForLog, null, 2));
-    console.log("[llm-proxy] Authorization: Bearer ..." + (upstreamAPIKey.slice(-4) || ""));
+    console.log("[chat/completions] upstream baseURL:", baseURL);
+    console.log("[chat/completions] request body:", JSON.stringify(bodyForLog, null, 2));
 
-    const response = await fetch(upstreamURL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${upstreamAPIKey}`,
-        ...(process.env.OPENROUTER_SITE_URL ? { "HTTP-Referer": process.env.OPENROUTER_SITE_URL } : {}),
-        ...(process.env.OPENROUTER_APP_NAME ? { "X-Title": process.env.OPENROUTER_APP_NAME } : {}),
-      },
-      body: JSON.stringify(payload),
-    });
+    // ── 6. 流式响应：TransformStream 逐 chunk 写入（需求 6）─────────────────
+    if (body.stream) {
+      const stream = new TransformStream();
+      const writer = stream.writable.getWriter();
+      const encoder = new TextEncoder();
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.log("[llm-proxy] upstream error:", response.status, errText.slice(0, 500));
-      const contentType = response.headers.get("content-type") || "application/json";
-      return new NextResponse(errText, { status: response.status, headers: { "Content-Type": contentType } });
-    }
+      try {
+        // RAG 知识库集成（需求 1：暂未接入，留作占位）
+        // if (process.env.KB_TYPE === "ragflow") {
+        //   const { kbContent } = await retrieveFromRagflow({ question: latestUserMessage?.content as string });
+        //   // inject kbContent into last user message
+        // } else if (process.env.KB_TYPE === "bailian") {
+        //   const { kbContent } = await retrieveFromBailian({ query: latestUserMessage?.content as string });
+        //   // inject kbContent into last user message
+        // }
 
-    // 直接透传上游响应体，兼容 SSE 流式输出（ZEGO 自定义 LLM 要求）
-    const headers = new Headers();
-    const contentType = response.headers.get("content-type");
-    if (contentType) headers.set("Content-Type", contentType);
-    const cacheControl = response.headers.get("cache-control");
-    if (cacheControl) headers.set("Cache-Control", cacheControl);
-    const connection = response.headers.get("connection");
-    if (connection) headers.set("Connection", connection);
+        const completion = await openai.chat.completions.create({
+          model,
+          stream: true,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          messages: payload.messages as any,
+        });
 
-    if (response.body) {
-      return new NextResponse(response.body, {
-        status: response.status,
-        headers,
+        // 注意⚠️：AIAgent 要求最后一个有效数据必须包含 "finish_reason":"stop"，
+        // 且最后必须发送 data: [DONE]，否则可能导致智能体不回答或回答不完整。
+        for await (const chunk of completion) {
+          const ssePart = `data: ${JSON.stringify(chunk)}\n\n`;
+          writer.write(encoder.encode(ssePart));
+        }
+      } catch (error) {
+        console.error("[chat/completions] stream processing error:", error);
+      } finally {
+        writer.write(encoder.encode("data: [DONE]\n\n"));
+        writer.close();
+        console.log("[chat/completions] writer closed");
+      }
+
+      return new Response(stream.readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+          "Access-Control-Allow-Origin": "*",
+        },
       });
     }
 
-    const fallbackText = await response.text();
-    if (!headers.has("Content-Type")) {
-      headers.set("Content-Type", "application/json");
-    }
-    return new NextResponse(fallbackText, {
-      status: response.status,
-      headers,
+    // ── 7. 非流式响应：透传上游内容（需求 7）────────────────────────────────
+    const completion = await openai.chat.completions.create({
+      model,
+      stream: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      messages: payload.messages as any,
     });
+    return NextResponse.json(completion);
   } catch (error) {
-    console.error("llm proxy failed:", error);
+    console.error("[chat/completions] llm proxy failed:", error);
     return NextResponse.json(
-      {
-        code: 500,
-        message: (error as Error).message || "llm proxy failed",
-      },
+      { code: 500, message: (error as Error).message || "llm proxy failed" },
       { status: 500 }
     );
   }
+}
+
+// CORS 预检
+export async function OPTIONS() {
+  return NextResponse.json(
+    {},
+    {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      },
+    }
+  );
 }
