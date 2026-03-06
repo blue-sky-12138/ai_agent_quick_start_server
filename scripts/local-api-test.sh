@@ -58,7 +58,7 @@ else
 fi
 echo ""
 
-echo "=== 4. 调用 LLM 代理 (POST /api/llm-proxy，模拟 ZEGO 带 agent_info) ==="
+echo "=== 4. 调用 LLM 代理 (POST /chat/completions，模拟 ZEGO 带 agent_info) ==="
 LLM_BODY=$(cat <<EOF
 {
   "model": "anthropic/claude-sonnet-4.6",
@@ -88,7 +88,7 @@ if [ -z "$AGENT_INSTANCE_ID" ]; then
 EOF
 )
 fi
-LLM_RES=$(curl -s -w "\n%{http_code}" -X POST "${BASE_URL}/api/llm-proxy" \
+LLM_RES=$(curl -s --max-time 90 -w "\n%{http_code}" -X POST "${BASE_URL}/chat/completions" \
   -H "Content-Type: application/json" \
   -d "$LLM_BODY")
 LLM_HTTP=$(echo "$LLM_RES" | tail -n1)

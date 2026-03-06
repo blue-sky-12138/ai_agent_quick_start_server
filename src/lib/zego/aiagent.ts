@@ -307,7 +307,7 @@ export class ZegoAIAgent {
     async registerAgent(agentId: string, agentName: string, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null) {
         const hasLlmUrl = !!(process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL);
         if (!hasLlmUrl) {
-            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/api/llm-proxy)');
+            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/chat/completions)');
         }
         const { LLM, TTS, ASR } = await this.getDefaultAgentConfig();
         // https://aigc-aiagent-api.zegotech.cn?Action=RegisterAgent
@@ -337,7 +337,7 @@ export class ZegoAIAgent {
     async updateAgent(agentId: string, agentName: string, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null) {
         const hasLlmUrl = !!(process.env.LLM_PROXY_PUBLIC_URL || process.env.LLM_BASE_URL);
         if (!hasLlmUrl) {
-            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/api/llm-proxy)');
+            throw new Error('LLM_PROXY_PUBLIC_URL or LLM_BASE_URL must be set (e.g. https://your-domain/chat/completions)');
         }
         const { LLM, TTS, ASR } = await this.getDefaultAgentConfig();
         // https://aigc-aiagent-api.zegotech.cn?Action=UpdateAgent
