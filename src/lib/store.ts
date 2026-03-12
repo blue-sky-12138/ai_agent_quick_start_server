@@ -9,6 +9,8 @@ export class AgentStore {
     private agentInstanceId: string = "";
     private userToAgentInstance = new Map<string, string>();
     private agentInstanceToImageDataURL = new Map<string, string>();
+    /** 实例对应的回答语言（中文名，用于 prompt 末尾「始终用xx语言回答」） */
+    private agentInstanceToLanguage = new Map<string, string>();
 
     private constructor() {}
 
@@ -71,5 +73,19 @@ export class AgentStore {
     public clearLatestImage(agentInstanceId: string): void {
         this.agentInstanceToImageDataURL.delete(String(agentInstanceId));
         console.log(`Cleared latest image (Memory): instance=${agentInstanceId}`);
+    }
+
+    public setLanguageForAgentInstance(agentInstanceId: string, languageName: string): void {
+        this.agentInstanceToLanguage.set(String(agentInstanceId), languageName);
+        console.log(`Saved language for instance (Memory): instance=${agentInstanceId}, language=${languageName}`);
+    }
+
+    public getLanguageForAgentInstance(agentInstanceId: string): string {
+        return this.agentInstanceToLanguage.get(String(agentInstanceId)) || "";
+    }
+
+    public clearLanguageForAgentInstance(agentInstanceId: string): void {
+        this.agentInstanceToLanguage.delete(String(agentInstanceId));
+        console.log(`Cleared language for instance (Memory): instance=${agentInstanceId}`);
     }
 }

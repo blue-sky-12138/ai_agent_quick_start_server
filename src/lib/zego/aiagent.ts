@@ -99,6 +99,7 @@ export interface TTSConfig {
 }
 
 export interface ASRConfig {
+    Vendor?: string;
     HotWord?: string;
     Params?: any;
 }
@@ -302,6 +303,12 @@ export class ZegoAIAgent {
                 Params: {}
             }
         }
+    }
+
+    /** 返回默认 TTS 配置（用于创建实例时合并 explicit_language 等参数） */
+    getDefaultTTSConfig(): TTSConfig {
+        const { TTS } = this.getDefaultAgentConfig();
+        return TTS;
     }
 
     async registerAgent(agentId: string, agentName: string, llmConfig: LLMConfig | null = null, ttsConfig: TTSConfig | null = null, asrConfig: ASRConfig | null = null) {

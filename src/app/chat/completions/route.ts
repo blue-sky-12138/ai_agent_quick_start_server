@@ -155,10 +155,14 @@ export async function POST(request: NextRequest) {
 
     const payload = imageDataURL ? withInjectedImage(body, imageDataURL) : { ...body };
 
-    // ── 3. 强制替换 system prompt（需求 4）──────────────────────────────────
-    const systemPrompt =
+    // ── 3. 强制替换 system prompt（需求 4），并按实例语言追加「始终用xx语言回答」──
+    let systemPrompt =
       (typeof process.env.LLM_PROXY_SYSTEM_PROMPT === "string" && process.env.LLM_PROXY_SYSTEM_PROMPT.trim()) ||
       DEFAULT_SYSTEM_PROMPT;
+    const languageName = agentInstanceId ? store.getLanguageForAgentInstance(agentInstanceId) : "";
+    if (languageName) {
+      systemPrompt = systemPrompt.trimEnd() + "\n始终用" + languageName + "语言回答。";
+    }
     const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
     const systemIndex = messages.findIndex((m) => m?.role === "system");
     const systemMessage = { role: "system" as const, content: systemPrompt };
