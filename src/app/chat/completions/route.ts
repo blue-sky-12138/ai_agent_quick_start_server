@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AgentStore } from "@/lib/store";
+import { insertLlmLog } from "@/lib/db";
 import OpenAI from "openai";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -125,6 +126,22 @@ function withInjectedImage(body: ChatRequestBody, imageDataURL: string): ChatReq
   return { ...body, messages: injectImageIntoLastUserMessage(messages, imageDataURL) };
 }
 
+/** 从 messages 中取最后一条 user 消息的文本内容（用于入库） */
+function getLastUserMessageContent(messages: ChatMessage[]): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "user") continue;
+    const c = messages[i].content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      const text = c.map((p) => (p?.type === "text" && p.text ? p.text : "")).filter(Boolean).join("");
+      return text;
+    }
+    return "";
+  }
+  return "";
+}
+
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
@@ -153,6 +170,13 @@ export async function POST(request: NextRequest) {
     const imageDataURL = agentInstanceId ? store.getLatestImageDataURL(agentInstanceId) : "";
     console.log("[chat/completions] agent_instance_id:", agentInstanceId || "(none)", "hasImage:", !!imageDataURL);
 
+    /** 日志用：便于按 agent_instance_id / agent_user_id / room_id 筛选 */
+    const logContext = {
+      agent_instance_id: body.agent_info?.agent_instance_id != null ? String(body.agent_info.agent_instance_id) : agentInstanceId || "",
+      agent_user_id: body.agent_info?.agent_user_id != null ? String(body.agent_info.agent_user_id) : "",
+      room_id: body.agent_info?.room_id != null ? String(body.agent_info.room_id) : "",
+    };
+
     const payload = imageDataURL ? withInjectedImage(body, imageDataURL) : { ...body };
 
     // ── 3. 强制替换 system prompt（需求 4），并按实例语言追加「始终用xx语言回答」──
@@ -161,7 +185,7 @@ export async function POST(request: NextRequest) {
       DEFAULT_SYSTEM_PROMPT;
     const languageName = agentInstanceId ? store.getLanguageForAgentInstance(agentInstanceId) : "";
     if (languageName) {
-      systemPrompt = systemPrompt.trimEnd() + "\n始终用" + languageName + "语言回答。";
+      systemPrompt = systemPrompt.trimEnd() + "\n主要使用" + languageName + "进行回答，但要根据用户实际对话语言进行匹配；若用户夹杂其他语言或术语，尽量以相同习惯与表达方式回复。";
     }
     const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
     const systemIndex = messages.findIndex((m) => m?.role === "system");
@@ -172,6 +196,18 @@ export async function POST(request: NextRequest) {
       messages.unshift(systemMessage);
     }
     payload.messages = messages;
+
+    // 异步写入 DB：询问内容（不阻塞接口）
+    const questionContent = getLastUserMessageContent(payload.messages);
+    if (logContext.agent_instance_id || logContext.room_id) {
+      insertLlmLog({
+        agent_instance_id: logContext.agent_instance_id,
+        agent_user_id: logContext.agent_user_id,
+        room_id: logContext.room_id,
+        type: "question",
+        content: questionContent,
+      });
+    }
 
     // ── 4. 强制覆盖 model（需求 9）──────────────────────────────────────────
     if (process.env.LLM_PROXY_UPSTREAM_MODEL) {
@@ -239,11 +275,24 @@ export async function POST(request: NextRequest) {
           messages: payload.messages as any,
         });
 
+        let llmOutputAcc = "";
         // 注意⚠️：AIAgent 要求最后一个有效数据必须包含 "finish_reason":"stop"，
         // 且最后必须发送 data: [DONE]，否则可能导致智能体不回答或回答不完整。
         for await (const chunk of completion) {
+          const content = (chunk as any).choices?.[0]?.delta?.content;
+          if (typeof content === "string") llmOutputAcc += content;
           const ssePart = `data: ${JSON.stringify(chunk)}\n\n`;
           writer.write(encoder.encode(ssePart));
+        }
+        if (llmOutputAcc) {
+          console.log("[chat/completions] LLM output (stream):", JSON.stringify({ ...logContext, content: llmOutputAcc }));
+          insertLlmLog({
+            agent_instance_id: logContext.agent_instance_id,
+            agent_user_id: logContext.agent_user_id,
+            room_id: logContext.room_id,
+            type: "answer",
+            content: llmOutputAcc,
+          });
         }
       } catch (error) {
         console.error("[chat/completions] stream processing error:", error);
@@ -270,6 +319,17 @@ export async function POST(request: NextRequest) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       messages: payload.messages as any,
     });
+    const llmOutput = (completion as any).choices?.[0]?.message?.content;
+    if (llmOutput != null) {
+      console.log("[chat/completions] LLM output:", JSON.stringify({ ...logContext, content: llmOutput }));
+      insertLlmLog({
+        agent_instance_id: logContext.agent_instance_id,
+        agent_user_id: logContext.agent_user_id,
+        room_id: logContext.room_id,
+        type: "answer",
+        content: llmOutput,
+      });
+    }
     return NextResponse.json(completion);
   } catch (error) {
     console.error("[chat/completions] llm proxy failed:", error);

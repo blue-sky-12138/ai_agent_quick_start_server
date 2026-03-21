@@ -17,9 +17,9 @@ function randomId(prefix: string) {
 /** 请求头 Lang 到 ASR 引擎（16k_xx）的映射 */
 const LANG_TO_ASR_ENGINE: Record<string, string> = {
   "ko-kr": "16k_ko",
-  "en-ww": "16k_en",
-  "zh-cn": "16k_zh",
-  "zh-hk": "16k_zh",
+  "en-ww": "16k_zh_en",
+  "zh-cn": "16k_zh_en",
+  "zh-hk": "16k_zh_en",
   "ru-ru": "16k_en",   // 俄语无直接引擎，暂用英文
   "id-id": "16k_id",
   "ja-jp": "16k_ja",
@@ -27,8 +27,8 @@ const LANG_TO_ASR_ENGINE: Record<string, string> = {
   "pt-pt": "16k_pt",
   "sr-sr": "16k_en",   // 塞尔维亚语无直接引擎，暂用英文
   "es-es": "16k_es",
-  "nan-cha": "16k_zh", // 闽南/潮汕，暂用中文
-  "zh-mars": "16k_zh",
+  "nan-cha": "16k_zh_en", // 闽南/潮汕，暂用中文
+  "zh-mars": "16k_zh_en",
   "ar-kw": "16k_ar",
   "vi-vn": "16k_vi",
   "tr-tk": "16k_tr",
@@ -79,7 +79,8 @@ const TTS_VOICE_TYPE_DEFAULT = "zh_female_vv_uranus_bigtts";
 
 /** 不在 ENGINE_MODEL_TYPE_TO_VOICE_TYPE 中的 engine_model_type 均使用 Minimax TTS */
 function useMinimaxTTS(engineModelType: string): boolean {
-  return !(engineModelType in ENGINE_MODEL_TYPE_TO_VOICE_TYPE);
+  return true;
+  // return !(engineModelType in ENGINE_MODEL_TYPE_TO_VOICE_TYPE);
 }
 
 /** engine_model_type（16k_xx）到 TTS voice_type 的映射（仅 ByteDance 使用；未在此表中的走 Minimax） */
@@ -204,13 +205,24 @@ export async function POST(req: NextRequest) {
       }
       return null;
     })();
-    const asrConfig: ASRConfig | null =
-      asrEngine != null
-        ? {
-            Vendor: "Tencent",
-            Params: { engine_model_type: asrEngine },
-          }
-        : null;
+    // const asrConfig: ASRConfig | null =
+    //   asrEngine != null
+    //     ? {
+    //         Vendor: "Tencent",
+    //         Params: { engine_model_type: asrEngine },
+    //       }
+    //     : null;
+
+      const  asrConfig: ASRConfig = {
+        "Vendor": "AliyunGummy",
+        "Params": {
+            "payload": {
+                "model": "gummy-realtime-v1"
+            }
+        }
+    }
+
+
     const messageHistory: MessageHistory | null = null;
     const callbackConfig: CallbackConfig | null = null;
     const advancedConfig: AdvancedConfig | null = process.env.ADVANCED_CONFIG ? parseJSON(process.env.ADVANCED_CONFIG) : null;
