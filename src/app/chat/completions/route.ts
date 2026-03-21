@@ -2,6 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { AgentStore } from "@/lib/store";
 import { insertLlmLog } from "@/lib/db";
 import OpenAI from "openai";
+import {
+  buildOpenAiNonStreamCompletionJson,
+  getLastAssistantText,
+  getRagKbMode,
+  getRagKbReChat,
+  getRagKbAuthHeaders,
+  isUserIdAllowedForRagKb,
+  ragKbChatCompletion,
+  runRagKbToolLoop,
+  serializeMessagesForRag,
+  writeOpenAiSseStreamFromText,
+} from "@/lib/rag-kb";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -126,6 +138,65 @@ function withInjectedImage(body: ChatRequestBody, imageDataURL: string): ChatReq
   return { ...body, messages: injectImageIntoLastUserMessage(messages, imageDataURL) };
 }
 
+function getRagKbInjectLabel(): string {
+  const s = (process.env.RAG_KB_INJECT_BLOCK_LABEL || "【知识库检索结果】").trim();
+  return s || "【知识库检索结果】";
+}
+
+function truncateRagKbInjectBody(text: string): string {
+  const maxChars = Math.min(
+    200_000,
+    Math.max(500, parseInt(process.env.RAG_KB_MAX_INJECT_CHARS || "16000", 10) || 16_000)
+  );
+  const t = text.trim();
+  if (!t) return "";
+  if (t.length <= maxChars) return t;
+  return `${t.slice(0, maxChars)}\n…(已截断)`;
+}
+
+/**
+ * 将知识库非流式返回的文本，以独立 `type: text` 段插入最后一条 user 的 content 最前（与图片的 content 数组并列）。
+ */
+function injectRagKnowledgeIntoLastUserMessage(messages: ChatMessage[], ragText: string): ChatMessage[] {
+  const label = getRagKbInjectLabel();
+  const body = truncateRagKbInjectBody(ragText);
+  if (!body) return messages;
+
+  const ragPart: ContentPart = {
+    type: "text",
+    text: `${label}\n${body}\n\n---\n`,
+  };
+
+  const nextMessages = [...messages];
+  let targetIndex = -1;
+  for (let i = nextMessages.length - 1; i >= 0; i -= 1) {
+    if (nextMessages[i]?.role === "user") {
+      targetIndex = i;
+      break;
+    }
+  }
+  if (targetIndex < 0) return nextMessages;
+
+  const targetMessage = nextMessages[targetIndex];
+  const currentContent = targetMessage.content;
+
+  let nextContent: ContentPart[] | string;
+  if (typeof currentContent === "string") {
+    nextContent = [ragPart, { type: "text", text: currentContent }];
+  } else if (Array.isArray(currentContent)) {
+    const withoutOldRag = currentContent.filter((p) => {
+      if (p?.type !== "text" || !p.text) return true;
+      return !p.text.trimStart().startsWith(label);
+    });
+    nextContent = [ragPart, ...withoutOldRag];
+  } else {
+    nextContent = [ragPart];
+  }
+
+  nextMessages[targetIndex] = { ...targetMessage, content: nextContent };
+  return nextMessages;
+}
+
 /** 从 messages 中取最后一条 user 消息的文本内容（用于入库） */
 function getLastUserMessageContent(messages: ChatMessage[]): string {
   if (!Array.isArray(messages)) return "";
@@ -154,14 +225,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Messages are required" }, { status: 400 });
     }
 
+    /** 解析 user / user_id / agent_info.user_id（用于实例映射；知识库另需命中 RAG_KB_ALLOWED_USER_IDS） */
+    const userIdForKb = resolveUserId(body);
+
     // ── 2. 解析 agentInstanceId，获取图片并注入（需求 2、3）───────────────────
     const store = AgentStore.getInstance();
 
     let agentInstanceId = resolveAgentInstanceId(request, body);
     if (!agentInstanceId) {
-      const userId = resolveUserId(body);
-      if (userId) {
-        agentInstanceId = store.getAgentInstanceIdByUserId(userId);
+      if (userIdForKb) {
+        agentInstanceId = store.getAgentInstanceIdByUserId(userIdForKb);
       }
     }
 
@@ -215,6 +288,68 @@ export async function POST(request: NextRequest) {
     }
     const model = payload.model || "";
 
+    // ── 4b. 知识库 RAG：仅当请求中带 user / user_id / agent_info.user_id 且配置了 URL 时启用 ──
+    const ragMode = getRagKbMode();
+    const ragKbUrl = (process.env.RAG_KB_COMPLETIONS_URL || "").trim();
+    const useRagKb = Boolean(
+      userIdForKb && ragMode !== "off" && ragKbUrl && isUserIdAllowedForRagKb(userIdForKb)
+    );
+    const ragToolMode = useRagKb && ragMode === "tool";
+    const ragProxyMode = useRagKb && ragMode === "proxy";
+
+    // proxy：先向知识库拉取非流式结果，再注入最后一条 user（多段 text，与图片并列），最后仍走上游 LLM
+    if (ragProxyMode) {
+      const ragHeaders = getRagKbAuthHeaders();
+      const ragMessages = serializeMessagesForRag(payload.messages);
+      const reChat = getRagKbReChat();
+      console.log("[chat/completions] RAG KB retrieve→inject user_id:", userIdForKb, "url:", ragKbUrl);
+
+      const ragResult = await ragKbChatCompletion({
+        url: ragKbUrl,
+        headers: ragHeaders,
+        messages: ragMessages,
+        reChat,
+        logLabel: "proxy",
+      });
+
+      if (ragResult.ok) {
+        const injectedBody = truncateRagKbInjectBody(ragResult.text);
+        if (injectedBody) {
+          payload.messages = injectRagKnowledgeIntoLastUserMessage(payload.messages as ChatMessage[], ragResult.text);
+          const injectLabel = getRagKbInjectLabel();
+          const appendSystem =
+            process.env.RAG_KB_SYSTEM_HINT_APPEND ??
+            "\n若用户消息最前含知识库检索段落，请结合该参考、人设与语言要求简洁作答；参考与问题无关时可忽略。";
+          if (appendSystem.trim()) {
+            const sysIdx = payload.messages.findIndex((m) => m?.role === "system");
+            if (sysIdx >= 0) {
+              const sm = payload.messages[sysIdx];
+              const c = sm.content;
+              if (typeof c === "string") {
+                payload.messages[sysIdx] = { ...sm, content: c + appendSystem };
+              }
+            }
+          }
+          console.log(
+            "[chat/completions] RAG KB injected → upstream LLM, blockLabel:",
+            injectLabel,
+            "injectChars:",
+            injectedBody.length,
+            "ragKbMs:",
+            ragResult.durationMs
+          );
+        }
+      } else if (!ragResult.ok) {
+        console.warn(
+          "[chat/completions] RAG KB retrieve failed, continue without injection, ragKbMs:",
+          ragResult.durationMs,
+          "status:",
+          ragResult.status,
+          ragResult.body
+        );
+      }
+    }
+
     // ── 5. 初始化 OpenAI 客户端（需求 5：不校验 token，直接用环境变量 key）──
     const upstreamAPIKey = process.env.LLM_PROXY_UPSTREAM_API_KEY || "";
     if (!upstreamAPIKey) {
@@ -230,9 +365,15 @@ export async function POST(request: NextRequest) {
 
     const openai = new OpenAI({ apiKey: upstreamAPIKey, baseURL });
 
+    const maxRagToolRounds = Math.min(
+      8,
+      Math.max(1, parseInt(process.env.RAG_KB_MAX_TOOL_ROUNDS || "4", 10) || 4)
+    );
+
     // 打印发往上游的请求体（base64 图片用占位符，避免刷屏）
     const bodyForLog = (() => {
       const copy = JSON.parse(JSON.stringify(payload)) as ChatRequestBody;
+      const ragLabelForLog = getRagKbInjectLabel();
       const m = copy.messages;
       if (Array.isArray(m)) {
         for (const msg of m) {
@@ -243,6 +384,13 @@ export async function POST(request: NextRequest) {
                 const len = part.image_url.url.length;
                 part.image_url = { url: `[base64 image, ${len} chars]` };
               }
+              if (
+                part?.type === "text" &&
+                typeof part.text === "string" &&
+                part.text.trimStart().startsWith(ragLabelForLog)
+              ) {
+                part.text = `[${ragLabelForLog} ${part.text.length} chars]`;
+              }
             }
           }
         }
@@ -250,6 +398,9 @@ export async function POST(request: NextRequest) {
       return copy;
     })();
     console.log("[chat/completions] upstream baseURL:", baseURL);
+    if (ragToolMode) {
+      console.log("[chat/completions] RAG KB tool mode user_id:", userIdForKb, "rounds<=", maxRagToolRounds);
+    }
     console.log("[chat/completions] request body:", JSON.stringify(bodyForLog, null, 2));
 
     // ── 6. 流式响应：TransformStream 逐 chunk 写入（需求 6）─────────────────
@@ -257,47 +408,67 @@ export async function POST(request: NextRequest) {
       const stream = new TransformStream();
       const writer = stream.writable.getWriter();
       const encoder = new TextEncoder();
+      let sseEnded = false;
 
       try {
-        // RAG 知识库集成（需求 1：暂未接入，留作占位）
-        // if (process.env.KB_TYPE === "ragflow") {
-        //   const { kbContent } = await retrieveFromRagflow({ question: latestUserMessage?.content as string });
-        //   // inject kbContent into last user message
-        // } else if (process.env.KB_TYPE === "bailian") {
-        //   const { kbContent } = await retrieveFromBailian({ query: latestUserMessage?.content as string });
-        //   // inject kbContent into last user message
-        // }
-
-        const completion = await openai.chat.completions.create({
-          model,
-          stream: true,
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          messages: payload.messages as any,
-        });
-
-        let llmOutputAcc = "";
-        // 注意⚠️：AIAgent 要求最后一个有效数据必须包含 "finish_reason":"stop"，
-        // 且最后必须发送 data: [DONE]，否则可能导致智能体不回答或回答不完整。
-        for await (const chunk of completion) {
-          const content = (chunk as any).choices?.[0]?.delta?.content;
-          if (typeof content === "string") llmOutputAcc += content;
-          const ssePart = `data: ${JSON.stringify(chunk)}\n\n`;
-          writer.write(encoder.encode(ssePart));
-        }
-        if (llmOutputAcc) {
-          console.log("[chat/completions] LLM output (stream):", JSON.stringify({ ...logContext, content: llmOutputAcc }));
-          insertLlmLog({
-            agent_instance_id: logContext.agent_instance_id,
-            agent_user_id: logContext.agent_user_id,
-            room_id: logContext.room_id,
-            type: "answer",
-            content: llmOutputAcc,
+        if (ragToolMode) {
+          const { messages: afterTool } = await runRagKbToolLoop({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            openai: openai as any,
+            model,
+            messages: payload.messages as unknown[],
+            ragUrl: ragKbUrl,
+            ragHeaders: getRagKbAuthHeaders(),
+            reChat: getRagKbReChat(),
+            maxToolRounds: maxRagToolRounds,
           });
+          const text = getLastAssistantText(afterTool);
+          await writeOpenAiSseStreamFromText(text, writer, encoder);
+          sseEnded = true;
+          if (text) {
+            console.log("[chat/completions] LLM+RAG tool output (stream):", JSON.stringify({ ...logContext, content: text }));
+            insertLlmLog({
+              agent_instance_id: logContext.agent_instance_id,
+              agent_user_id: logContext.agent_user_id,
+              room_id: logContext.room_id,
+              type: "answer",
+              content: text,
+            });
+          }
+        } else {
+          const completion = await openai.chat.completions.create({
+            model,
+            stream: true,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            messages: payload.messages as any,
+          });
+
+          let llmOutputAcc = "";
+          // 注意⚠️：AIAgent 要求最后一个有效数据必须包含 "finish_reason":"stop"，
+          // 且最后必须发送 data: [DONE]，否则可能导致智能体不回答或回答不完整。
+          for await (const chunk of completion) {
+            const content = (chunk as any).choices?.[0]?.delta?.content;
+            if (typeof content === "string") llmOutputAcc += content;
+            const ssePart = `data: ${JSON.stringify(chunk)}\n\n`;
+            writer.write(encoder.encode(ssePart));
+          }
+          if (llmOutputAcc) {
+            console.log("[chat/completions] LLM output (stream):", JSON.stringify({ ...logContext, content: llmOutputAcc }));
+            insertLlmLog({
+              agent_instance_id: logContext.agent_instance_id,
+              agent_user_id: logContext.agent_user_id,
+              room_id: logContext.room_id,
+              type: "answer",
+              content: llmOutputAcc,
+            });
+          }
         }
       } catch (error) {
         console.error("[chat/completions] stream processing error:", error);
       } finally {
-        writer.write(encoder.encode("data: [DONE]\n\n"));
+        if (!sseEnded) {
+          writer.write(encoder.encode("data: [DONE]\n\n"));
+        }
         writer.close();
         console.log("[chat/completions] writer closed");
       }
@@ -313,6 +484,31 @@ export async function POST(request: NextRequest) {
     }
 
     // ── 7. 非流式响应：透传上游内容（需求 7）────────────────────────────────
+    if (ragToolMode) {
+      const { messages: afterTool } = await runRagKbToolLoop({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        openai: openai as any,
+        model,
+        messages: payload.messages as unknown[],
+        ragUrl: ragKbUrl,
+        ragHeaders: getRagKbAuthHeaders(),
+        reChat: getRagKbReChat(),
+        maxToolRounds: maxRagToolRounds,
+      });
+      const text = getLastAssistantText(afterTool);
+      if (text) {
+        console.log("[chat/completions] LLM+RAG tool output:", JSON.stringify({ ...logContext, content: text }));
+        insertLlmLog({
+          agent_instance_id: logContext.agent_instance_id,
+          agent_user_id: logContext.agent_user_id,
+          room_id: logContext.room_id,
+          type: "answer",
+          content: text,
+        });
+      }
+      return NextResponse.json(buildOpenAiNonStreamCompletionJson(model, text));
+    }
+
     const completion = await openai.chat.completions.create({
       model,
       stream: false,
