@@ -1,6 +1,6 @@
 /**
  * RAG 知识库：按 RAG_KB_MODE 支持
- * - proxy：先请求知识库 Chat Completions（非流式）取检索文本，注入最后一条 user 的 content（与多模态多段 text 并列），再请求上游 LLM
+ * - proxy：先请求知识库（默认 stream:true 解析 SSE 累积正文；可关 RAG_KB_STREAM），注入最后一条 user，再请求上游 LLM
  * - tool：仍走上游 LLM，通过 function calling 调用知识库接口拉取片段再回答
  */
 
@@ -27,6 +27,11 @@ export function getRagKbAuthHeaders(): Record<string, string> {
 
 export function getRagKbReChat(): boolean {
   return (process.env.RAG_KB_RE_CHAT || "").trim().toLowerCase() === "true";
+}
+
+/** 对 MaxKB 等支持 SSE 的接口使用 stream:true 拉取（默认开启）；false 时用非流式 JSON */
+export function getRagKbUseStream(): boolean {
+  return (process.env.RAG_KB_STREAM || "true").trim().toLowerCase() !== "false";
 }
 
 /**
@@ -82,27 +87,186 @@ function logRagKbOutcome(params: {
   text?: string;
   status?: number;
   errorBody?: string;
+  stream?: boolean;
+  firstDeltaMs?: number;
 }): void {
   const verbose = isRagKbVerboseLog();
   const maxChars = getRagKbLogMaxChars();
+  const streamTag = params.stream === true ? " sse" : "";
+  const firstTag =
+    params.firstDeltaMs != null ? ` firstDeltaMs=${params.firstDeltaMs.toFixed(1)}` : "";
   if (params.ok && params.text != null) {
     const full = params.text;
     if (!verbose) {
       console.log(
-        `[rag-kb] ${params.label} ok durationMs=${params.durationMs.toFixed(1)} textChars=${full.length} (set RAG_KB_LOG=verbose for full text)`
+        `[rag-kb] ${params.label} ok${streamTag}${firstTag} durationMs=${params.durationMs.toFixed(1)} textChars=${full.length} (set RAG_KB_LOG=verbose for full text)`
       );
       return;
     }
     const printed = full.length > maxChars ? `${full.slice(0, maxChars)}…(全文共 ${full.length} 字)` : full;
     console.log(
-      `[rag-kb] ${params.label} ok durationMs=${params.durationMs.toFixed(1)} text:\n${printed}`
+      `[rag-kb] ${params.label} ok${streamTag}${firstTag} durationMs=${params.durationMs.toFixed(1)} text:\n${printed}`
     );
   } else {
     console.log(
-      `[rag-kb] ${params.label} fail durationMs=${params.durationMs.toFixed(1)} status=${params.status} body:`,
+      `[rag-kb] ${params.label} fail${streamTag} durationMs=${params.durationMs.toFixed(1)} status=${params.status} body:`,
       (params.errorBody || "").slice(0, 2000)
     );
   }
+}
+
+function extractTextFromOpenAiStyleSseJson(j: Record<string, unknown>): string {
+  const choices = j.choices as unknown[] | undefined;
+  const c0 = choices?.[0] as Record<string, unknown> | undefined;
+  if (!c0) return "";
+  const delta = c0.delta as Record<string, unknown> | undefined;
+  const dc = delta?.content;
+  if (typeof dc === "string") return dc;
+  const msg = c0.message as Record<string, unknown> | undefined;
+  const mc = msg?.content;
+  if (typeof mc === "string") return mc;
+  return "";
+}
+
+/**
+ * 读取 OpenAI 兼容的 text/event-stream，累积 assistant 文本（delta.content 或末包 message.content）
+ */
+async function accumulateOpenAiSseStream(
+  body: ReadableStream<Uint8Array> | null,
+  options?: {
+    onFirstDelta?: () => void;
+  }
+): Promise<string> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let acc = "";
+  let firstReported = false;
+
+  const processLine = (line: string) => {
+    const t = line.trim();
+    if (!t.startsWith("data:")) return;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const j = JSON.parse(payload) as Record<string, unknown>;
+      const piece = extractTextFromOpenAiStyleSseJson(j);
+      if (piece) {
+        if (!firstReported) {
+          firstReported = true;
+          options?.onFirstDelta?.();
+        }
+        acc += piece;
+      }
+    } catch {
+      /* 忽略非 JSON 行 */
+    }
+  };
+
+  const flushBlock = (block: string) => {
+    for (const line of block.split("\n")) {
+      processLine(line);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx: number;
+    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      flushBlock(block);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    const parts = buffer.split("\n\n");
+    for (const p of parts) flushBlock(p);
+  }
+  return acc;
+}
+
+/** 流式：向知识库发 stream:true，解析 SSE 直至结束，再得到完整正文（供注入 LLM；LLM 侧仍须整段 messages） */
+export async function ragKbChatCompletionStream(params: {
+  url: string;
+  headers: Record<string, string>;
+  messages: unknown[];
+  reChat: boolean;
+  logLabel?: string;
+}): Promise<
+  | { ok: true; text: string; durationMs: number; firstDeltaMs?: number }
+  | { ok: false; status: number; body: string; durationMs: number }
+> {
+  const label = params.logLabel || "rag-kb";
+  const t0 = performance.now();
+  let firstDeltaMs: number | undefined;
+
+  const res = await fetch(params.url, {
+    method: "POST",
+    headers: params.headers,
+    body: JSON.stringify({
+      messages: serializeMessagesForRag(params.messages),
+      re_chat: params.reChat,
+      stream: true,
+    }),
+  });
+
+  if (!res.ok) {
+    const raw = await res.text();
+    const durationMs = performance.now() - t0;
+    logRagKbOutcome({
+      label,
+      durationMs,
+      ok: false,
+      status: res.status,
+      errorBody: raw,
+      stream: true,
+    });
+    return { ok: false, status: res.status, body: raw.slice(0, 2000), durationMs };
+  }
+
+  const text = await accumulateOpenAiSseStream(res.body, {
+    onFirstDelta: () => {
+      firstDeltaMs = performance.now() - t0;
+    },
+  });
+  const durationMs = performance.now() - t0;
+  logRagKbOutcome({
+    label,
+    durationMs,
+    ok: true,
+    text,
+    stream: true,
+    firstDeltaMs,
+  });
+  return { ok: true, text, durationMs, firstDeltaMs };
+}
+
+/** 按 RAG_KB_STREAM 自动选择流式或非流式请求知识库 */
+export async function ragKbChatCompletionAuto(params: {
+  url: string;
+  headers: Record<string, string>;
+  messages: unknown[];
+  reChat: boolean;
+  logLabel?: string;
+  /** 覆盖环境变量 RAG_KB_STREAM */
+  useStream?: boolean;
+}): Promise<
+  | { ok: true; text: string; durationMs: number; firstDeltaMs?: number }
+  | { ok: false; status: number; body: string; durationMs: number }
+> {
+  const stream = params.useStream ?? getRagKbUseStream();
+  if (stream) {
+    return ragKbChatCompletionStream(params);
+  }
+  const r = await ragKbChatCompletion(params);
+  if (r.ok) {
+    return { ok: true, text: r.text, durationMs: r.durationMs, firstDeltaMs: undefined };
+  }
+  return r;
 }
 
 /** 非流式：向知识库 Chat Completions 发单轮/多轮，返回助手文本 */
@@ -227,7 +391,7 @@ export async function runRagKbToolLoop(params: {
       if (name === "query_knowledge_base") {
         const { query } = parseToolArgs(tc.function?.arguments);
         const q = (query || "").trim() || "用户问题";
-        const ragResult = await ragKbChatCompletion({
+        const ragResult = await ragKbChatCompletionAuto({
           url: params.ragUrl,
           headers: params.ragHeaders,
           messages: [{ role: "user", content: q }],
@@ -294,11 +458,15 @@ const STREAM_CHUNK_SIZE = 32;
 export async function writeOpenAiSseStreamFromText(
   text: string,
   writer: WritableStreamDefaultWriter<Uint8Array>,
-  encoder: TextEncoder
+  encoder: TextEncoder,
+  options?: { onFirstContentChunk?: () => void }
 ): Promise<void> {
   const id = `chatcmpl-${Date.now()}`;
   for (let i = 0; i < text.length; i += STREAM_CHUNK_SIZE) {
     const piece = text.slice(i, i + STREAM_CHUNK_SIZE);
+    if (i === 0 && piece.length > 0) {
+      options?.onFirstContentChunk?.();
+    }
     const chunk = {
       id,
       object: "chat.completion.chunk",

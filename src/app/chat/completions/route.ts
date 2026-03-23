@@ -9,7 +9,7 @@ import {
   getRagKbReChat,
   getRagKbAuthHeaders,
   isUserIdAllowedForRagKb,
-  ragKbChatCompletion,
+  ragKbChatCompletionAuto,
   runRagKbToolLoop,
   serializeMessagesForRag,
   writeOpenAiSseStreamFromText,
@@ -216,6 +216,8 @@ function getLastUserMessageContent(messages: ChatMessage[]): string {
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  /** 从本接口收到请求开始计时，用于统计到 LLM 首字/完整响应的延迟 */
+  const requestT0 = performance.now();
   try {
     // ── 1. 解析请求体 ────────────────────────────────────────────────────────
     const body = (await request.json()) as ChatRequestBody;
@@ -304,7 +306,7 @@ export async function POST(request: NextRequest) {
       const reChat = getRagKbReChat();
       console.log("[chat/completions] RAG KB retrieve→inject user_id:", userIdForKb, "url:", ragKbUrl);
 
-      const ragResult = await ragKbChatCompletion({
+      const ragResult = await ragKbChatCompletionAuto({
         url: ragKbUrl,
         headers: ragHeaders,
         messages: ragMessages,
@@ -336,7 +338,9 @@ export async function POST(request: NextRequest) {
             "injectChars:",
             injectedBody.length,
             "ragKbMs:",
-            ragResult.durationMs
+            ragResult.durationMs,
+            "ragKbFirstDeltaMs:",
+            ragResult.firstDeltaMs ?? "(n/a)"
           );
         }
       } else if (!ragResult.ok) {
@@ -423,7 +427,20 @@ export async function POST(request: NextRequest) {
             maxToolRounds: maxRagToolRounds,
           });
           const text = getLastAssistantText(afterTool);
-          await writeOpenAiSseStreamFromText(text, writer, encoder);
+          console.log(
+            "[chat/completions] 接口→LLM回答就绪延迟 ms (tool 模式，上游为非流式):",
+            (performance.now() - requestT0).toFixed(1),
+            JSON.stringify(logContext)
+          );
+          await writeOpenAiSseStreamFromText(text, writer, encoder, {
+            onFirstContentChunk: () => {
+              console.log(
+                "[chat/completions] 接口→下行 SSE 首包延迟 ms (合成流式分块):",
+                (performance.now() - requestT0).toFixed(1),
+                JSON.stringify(logContext)
+              );
+            },
+          });
           sseEnded = true;
           if (text) {
             console.log("[chat/completions] LLM+RAG tool output (stream):", JSON.stringify({ ...logContext, content: text }));
@@ -444,10 +461,19 @@ export async function POST(request: NextRequest) {
           });
 
           let llmOutputAcc = "";
+          let loggedFirstLlmToken = false;
           // 注意⚠️：AIAgent 要求最后一个有效数据必须包含 "finish_reason":"stop"，
           // 且最后必须发送 data: [DONE]，否则可能导致智能体不回答或回答不完整。
           for await (const chunk of completion) {
             const content = (chunk as any).choices?.[0]?.delta?.content;
+            if (typeof content === "string" && content.length > 0 && !loggedFirstLlmToken) {
+              loggedFirstLlmToken = true;
+              console.log(
+                "[chat/completions] 接口→LLM首字延迟 ms (流式):",
+                (performance.now() - requestT0).toFixed(1),
+                JSON.stringify(logContext)
+              );
+            }
             if (typeof content === "string") llmOutputAcc += content;
             const ssePart = `data: ${JSON.stringify(chunk)}\n\n`;
             writer.write(encoder.encode(ssePart));
@@ -496,6 +522,11 @@ export async function POST(request: NextRequest) {
         maxToolRounds: maxRagToolRounds,
       });
       const text = getLastAssistantText(afterTool);
+      console.log(
+        "[chat/completions] 接口→LLM回答就绪延迟 ms (tool+非流式):",
+        (performance.now() - requestT0).toFixed(1),
+        JSON.stringify(logContext)
+      );
       if (text) {
         console.log("[chat/completions] LLM+RAG tool output:", JSON.stringify({ ...logContext, content: text }));
         insertLlmLog({
@@ -515,6 +546,11 @@ export async function POST(request: NextRequest) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       messages: payload.messages as any,
     });
+    console.log(
+      "[chat/completions] 接口→LLM完整响应延迟 ms (非流式，无首字概念):",
+      (performance.now() - requestT0).toFixed(1),
+      JSON.stringify(logContext)
+    );
     const llmOutput = (completion as any).choices?.[0]?.message?.content;
     if (llmOutput != null) {
       console.log("[chat/completions] LLM output:", JSON.stringify({ ...logContext, content: llmOutput }));
