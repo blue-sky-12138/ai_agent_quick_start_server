@@ -217,8 +217,11 @@ export async function POST(req: NextRequest) {
         "Vendor": "AliyunGummy",
         "Params": {
             "payload": {
-                "model": "gummy-realtime-v1"
-            }
+                "model": "gummy-realtime-v1",
+                // "max_end_silence": 2000
+            },
+            // "VADSilenceSegmentation": 1000,
+            // "PauseInterval": 2000
         }
     }
 
