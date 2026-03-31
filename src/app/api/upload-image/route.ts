@@ -83,6 +83,9 @@ export async function POST(request: NextRequest) {
     const base64 = buffer.toString("base64");
     const imageDataURL = `data:${file.type};base64,${base64}`;
 
+    const store = AgentStore.getInstance();
+    store.setLatestImageDataURL(agentInstanceId, imageDataURL);
+
     const imageId = await insertUploadedImage({
       agent_instance_id: agentInstanceId,
       file_name: file.name,
@@ -91,33 +94,34 @@ export async function POST(request: NextRequest) {
       image_buffer: buffer,
     });
 
+    let imageUrl = "";
+    let resolvedImageId = 0;
+
     if (imageId == null) {
-      return NextResponse.json(
-        {
-          code: 503,
-          message:
-            "failed to persist image: check DB_HOST / DB_USER / DB_PASSWORD / DB_DATABASE (use szb02 for uploaded images)",
-        },
-        { status: 503 }
-      );
+      console.error("[upload-image] 图片持久化失败（入库失败），返回 image_id=0、image_url 为空", {
+        agent_instance_id: agentInstanceId,
+        file_name: file.name,
+        file_size: file.size,
+      });
+    } else {
+      resolvedImageId = imageId;
+      const origin = resolveImageUrlOrigin();
+      imageUrl = `${origin}/api/get_upload_image?id=${imageId}`;
     }
 
-    const store = AgentStore.getInstance();
-    store.setLatestImageDataURL(agentInstanceId, imageDataURL);
-
-    const origin = resolveImageUrlOrigin();
-    const imageUrl = `${origin}/api/get_upload_image?id=${imageId}`;
-
-    return NextResponse.json({
-      code: 0,
-      message: "upload image success",
-      agent_instance_id: agentInstanceId,
-      image_id: imageId,
-      image_url: imageUrl,
-      file_name: file.name,
-      file_type: file.type,
-      file_size: file.size,
-    });
+    return NextResponse.json(
+      {
+        code: 0,
+        message: "upload image success",
+        agent_instance_id: agentInstanceId,
+        image_id: resolvedImageId,
+        image_url: imageUrl,
+        file_name: file.name,
+        file_type: file.type,
+        file_size: file.size,
+      },
+      { status: 200 }
+    );
   } catch (error) {
     console.error("upload image failed:", error);
     return NextResponse.json(

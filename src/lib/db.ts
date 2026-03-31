@@ -8,8 +8,39 @@ import mysql from "mysql2/promise";
 const TABLE_NAME = "iwala_aiagent_llm_logs";
 /** 上传图片表（建议使用库名 szb02：DB_DATABASE=szb02） */
 const IMAGE_TABLE_NAME = "iwala_aiagent_uploaded_images";
+const AGENT_CONFIG_TABLE = "iwala_aiagent_config";
+/** iwala_aiagent_config 中 Minimax TTS 的 config_key */
+const MINIMAX_TTS_CONFIG_KEY = "tts_minimax";
 
 export type LlmLogType = "question" | "answer";
+
+/** 从 config_value JSON 解析出的 Minimax TTS 字段（见 sql/iwala_aiagent_config.sql） */
+export interface MinimaxTtsConfigRow {
+  api_key: string;
+  group_id: string | null;
+  model: string;
+  voice_id: string;
+}
+
+function parseMinimaxTtsConfigValue(raw: string | null | undefined): MinimaxTtsConfigRow | null {
+  if (raw == null || raw.trim() === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const o = parsed as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const apiKey = str(o.api_key);
+  const model = str(o.model);
+  const voiceId = str(o.voice_id);
+  const gid = o.group_id;
+  const groupId =
+    gid == null || gid === "" ? null : typeof gid === "string" ? gid : String(gid);
+  return { api_key: apiKey, group_id: groupId, model, voice_id: voiceId };
+}
 
 export interface LlmLogRow {
   agent_instance_id: string;
@@ -160,6 +191,33 @@ export async function getUploadedImageById(id: number): Promise<UploadedImageRow
     };
   } catch (err) {
     console.error("[db] getUploadedImageById error:", err);
+    return null;
+  } finally {
+    conn?.release();
+  }
+}
+
+/**
+ * 从 iwala_aiagent_config 读取 Minimax TTS（config_key 默认 tts_minimax，config_value 为 JSON）。
+ * 未配置数据库、查询报错、无行、config_value 为空或 JSON 非法时返回 null，由调用方回退环境变量。
+ */
+export async function getMinimaxTtsConfigFromDb(
+  configKey: string = process.env.TTS_MINIMAX_CONFIG_KEY ?? MINIMAX_TTS_CONFIG_KEY
+): Promise<MinimaxTtsConfigRow | null> {
+  const p = getPool();
+  if (!p) return null;
+  let conn: mysql.PoolConnection | null = null;
+  try {
+    conn = await p.getConnection();
+    const [rows] = await conn.query<mysql.RowDataPacket[]>(
+      `SELECT config_value FROM ${AGENT_CONFIG_TABLE} WHERE config_key = ? LIMIT 1`,
+      [configKey]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return parseMinimaxTtsConfigValue(row.config_value as string | null);
+  } catch (err) {
+    console.error("[db] getMinimaxTtsConfigFromDb error:", err);
     return null;
   } finally {
     conn?.release();

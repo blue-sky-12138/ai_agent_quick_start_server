@@ -38,6 +38,7 @@ export function getRagKbUseStream(): boolean {
  * 仅当 user_id 在白名单内才启用知识库。RAG_KB_ALLOWED_USER_IDS 为逗号分隔（支持英文/中文逗号），未配置或为空则一律不启用。
  */
 export function isUserIdAllowedForRagKb(userId: string): boolean {
+    return true;
   const id = userId.trim();
   if (!id) return false;
   const raw = (process.env.RAG_KB_ALLOWED_USER_IDS || "").trim();

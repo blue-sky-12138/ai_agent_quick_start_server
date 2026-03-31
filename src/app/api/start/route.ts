@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { ZegoAIAgent, CONSTANTS, AdvancedConfig, LLMConfig, TTSConfig, ASRConfig, MessageHistory, CallbackConfig } from "@/lib/zego/aiagent";
 import { AgentStore } from "@/lib/store";
 import { parseJSON } from "@/lib/json";
+import { getMinimaxTtsConfigFromDb } from "@/lib/db";
 
 // 定义请求体类型
 interface RequestBody {
@@ -169,42 +170,52 @@ export async function POST(req: NextRequest) {
     const ttsVoice = asrEngine ? engineToVoiceType(asrEngine) : "";
     let ttsVendor: string | undefined;
     let ttsVoiceUsed = ttsVoice;
-    const ttsConfig: TTSConfig | null = (() => {
-      if (asrEngine && useMinimaxTTS(asrEngine)) {
-        const apiKey = process.env.TTS_MINIMAX_API_KEY ?? "zego_test";
-        const groupId = process.env.TTS_MINIMAX_GROUP_ID;
-        const model = process.env.TTS_MINIMAX_MODEL ?? "speech-02-turbo-preview";
-        const voiceId = process.env.TTS_MINIMAX_VOICE_ID ?? "female-shaonv";
-        ttsVendor = "Minimax";
-        ttsVoiceUsed = voiceId;
-        const app: Record<string, string> = { api_key: apiKey };
-        if (groupId) app.group_id = groupId;
-        return {
-          Vendor: "Minimax",
-          Params: {
-            app,
-            model,
-            voice_setting: { voice_id: voiceId },
+    let ttsConfig: TTSConfig | null = null;
+    if (asrEngine && useMinimaxTTS(asrEngine)) {
+      const dbRow = await getMinimaxTtsConfigFromDb();
+      const apiKey =
+        dbRow && dbRow.api_key.trim() !== ""
+          ? dbRow.api_key.trim()
+          : process.env.TTS_MINIMAX_API_KEY ?? "zego_test";
+      const groupId =
+        dbRow && dbRow.group_id != null && dbRow.group_id.trim() !== ""
+          ? dbRow.group_id.trim()
+          : process.env.TTS_MINIMAX_GROUP_ID;
+      const model =
+        dbRow && dbRow.model.trim() !== ""
+          ? dbRow.model.trim()
+          : process.env.TTS_MINIMAX_MODEL ?? "speech-02-turbo-preview";
+      const voiceId =
+        dbRow && dbRow.voice_id.trim() !== ""
+          ? dbRow.voice_id.trim()
+          : process.env.TTS_MINIMAX_VOICE_ID ?? "female-shaonv";
+      ttsVendor = "Minimax";
+      ttsVoiceUsed = voiceId;
+      const app: Record<string, string> = { api_key: apiKey };
+      if (groupId) app.group_id = groupId;
+      ttsConfig = {
+        Vendor: "Minimax",
+        Params: {
+          app,
+          model,
+          voice_setting: { voice_id: voiceId },
+        },
+      };
+    } else if (explicitLanguage != null) {
+      const defaultTTS = assistant.getDefaultTTSConfig();
+      const defaultAudio = (defaultTTS.Params as any)?.audio ?? {};
+      ttsConfig = {
+        ...defaultTTS,
+        Params: {
+          ...defaultTTS.Params,
+          audio: {
+            ...defaultAudio,
+            voice_type: ttsVoice,
+            explicit_language: explicitLanguage,
           },
-        };
-      }
-      if (explicitLanguage != null) {
-        const defaultTTS = assistant.getDefaultTTSConfig();
-        const defaultAudio = (defaultTTS.Params as any)?.audio ?? {};
-        return {
-          ...defaultTTS,
-          Params: {
-            ...defaultTTS.Params,
-            audio: {
-              ...defaultAudio,
-              voice_type: ttsVoice,
-              explicit_language: explicitLanguage,
-            },
-          },
-        };
-      }
-      return null;
-    })();
+        },
+      };
+    }
     // const asrConfig: ASRConfig | null =
     //   asrEngine != null
     //     ? {
