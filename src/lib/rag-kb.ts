@@ -316,7 +316,7 @@ const KB_TOOL = {
   function: {
     name: "query_knowledge_base",
     description:
-      "从企业知识库检索与用户问题相关的资料。涉及政策、规则、产品说明、操作步骤等问题时应调用；用简短查询词检索。",
+      "根据用户问题从企业知识库做 RAG 检索，返回片段仅供参考。涉及政策、规则、产品说明、操作步骤等问题时可调用；用简短查询词检索。回答时不要盲从检索结果，需结合用户意图与常识独立判断。",
     parameters: {
       type: "object",
       properties: {

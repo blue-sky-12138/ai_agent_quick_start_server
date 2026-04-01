@@ -262,6 +262,9 @@ export async function POST(request: NextRequest) {
     if (languageName) {
       systemPrompt = systemPrompt.trimEnd() + "\n主要使用" + languageName + "进行回答，但要根据用户实际对话语言进行匹配；若用户夹杂其他语言或术语，尽量以相同习惯与表达方式回复。";
     }
+    systemPrompt =
+      systemPrompt.trimEnd() +
+      "\n仅输出纯文本最终答案，不要输出任何格式化内容（不要使用 Markdown、代码块、列表、标题、加粗、斜体、表格、HTML/XML 标签）。同时禁止输出任何思维链内容或标签（例如 <think>、</think>）。";
     const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
     const systemIndex = messages.findIndex((m) => m?.role === "system");
     const systemMessage = { role: "system" as const, content: systemPrompt };
@@ -321,7 +324,7 @@ export async function POST(request: NextRequest) {
           const injectLabel = getRagKbInjectLabel();
           const appendSystem =
             process.env.RAG_KB_SYSTEM_HINT_APPEND ??
-            "\n若用户消息最前含知识库检索段落，请结合该参考、人设与语言要求简洁作答；参考与问题无关时可忽略。";
+            "\n用户消息最前的知识库段落，是根据当前用户问题进行的 RAG 检索结果，仅供你参考。请勿盲从或整段照搬；应结合用户真实意图、图片（如有）、常识与人设独立判断后简洁作答；参考与问题无关、过时或明显矛盾时以用户问题与安全合规为准，可忽略参考。";
           if (appendSystem.trim()) {
             const sysIdx = payload.messages.findIndex((m) => m?.role === "system");
             if (sysIdx >= 0) {

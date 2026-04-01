@@ -224,6 +224,8 @@ export async function POST(req: NextRequest) {
     //       }
     //     : null;
 
+    console.log("explicitLanguage =============================:", explicitLanguage != null);
+
       const  asrConfig: ASRConfig = {
         "Vendor": "AliyunGummy",
         "Params": {
